@@ -5,11 +5,19 @@ import (
     "io"
     "net/http"
     "crypto/tls"
+    "golang.org/x/crypto/ssh/terminal"
     "fmt"
-    "time"
     "log"
     "flag"
+    "syscall"
+    "io/ioutil"
+    "math/rand"
+    "time"
 )
+
+func init() {
+    rand.Seed(time.Now().UnixNano())
+}
 
 func main() {
     httpTail := HttpTail{
@@ -22,12 +30,18 @@ func main() {
         },
     }
 
-    flag.StringVar(&httpTail.Username, "u", "",
-                   "Specify the username on an HTTP server")
-    flag.StringVar(&httpTail.Password, "p", "",
-                   "Specify the password on an HTTP server.")
+    flag.StringVar(&httpTail.Username, "u", "", "Specify the username on an HTTP server")
+    readPassword := flag.Bool("p", false, "Specify the password on an HTTP server")
 
     flag.Parse()
+
+    if *readPassword {
+        pwd, err := ReadPassword()
+        if err != nil {
+            log.Fatal(err)
+        }
+        httpTail.SetPassword(string(pwd))
+    }
 
     httpTail.Url = flag.Arg(0)
     if _, err := io.Copy(os.Stdout, &httpTail); err != nil {
@@ -41,12 +55,28 @@ type HttpTail struct {
     Username string
     Password string
     Pos int64
+    Key []byte
+}
+
+func (self *HttpTail) SetPassword(p string) {
+    // TODO: crypt with random key
+    self.Password = p
+}
+
+func (self *HttpTail) GetPassword() string {
+    // TODO: uncrypt with random key
+    return self.Password
 }
 
 func (self *HttpTail) Read(p []byte) (n int, err error) {
     if self.Pos == 0 {
         if self.Pos, err = self.ContentLength(); err != nil {
             return 0, err
+        }
+        if self.Pos > 1024 {
+            self.Pos -= 1024
+        } else {
+            self.Pos = 0
         }
     }
 
@@ -56,7 +86,7 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
     }
 
     if len(self.Username) > 0 && len(self.Password) > 0 {
-        req.SetBasicAuth(self.Username, self.Password)
+        req.SetBasicAuth(self.Username, self.GetPassword())
     }
 
     req.Header.Set("Range", fmt.Sprintf("bytes=%d-", self.Pos))
@@ -108,4 +138,20 @@ func (self *HttpTail) ContentLength() (n int64, err error) {
     }
 
     return 0, nil
+}
+
+func ReadPassword() ([]byte, error) {
+    if terminal.IsTerminal(syscall.Stdin) {
+        pwd, err := terminal.ReadPassword(syscall.Stdin)
+        if err != nil {
+            return nil, err
+        }
+        return pwd, nil
+    } else {
+        pwd, err := ioutil.ReadAll(os.Stdin)
+        if err != nil {
+            return nil, err
+        }
+        return pwd[:len(pwd) - 1], nil
+    }
 }
