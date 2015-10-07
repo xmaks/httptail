@@ -1,33 +1,27 @@
 package main
 
 import (
-    "os"
-    "io"
-    "net/http"
+    "crypto/aes"
+    "crypto/cipher"
+    "crypto/rand"
     "crypto/tls"
-    "golang.org/x/crypto/ssh/terminal"
-    "fmt"
-    "log"
+    "encoding/base64"
     "flag"
-    "syscall"
+    "fmt"
+    "golang.org/x/crypto/ssh/terminal"
+    "io"
     "io/ioutil"
-    "math/rand"
+    "log"
+    "net/http"
+    "os"
+    "syscall"
     "time"
 )
 
-func init() {
-    rand.Seed(time.Now().UnixNano())
-}
-
 func main() {
-    httpTail := HttpTail{
-        Client: &http.Client{
-            Transport: &http.Transport{
-                TLSClientConfig: &tls.Config{
-                    InsecureSkipVerify: true,
-                },
-            },
-        },
+    httpTail, err := NewHttpTail()
+    if err != nil {
+        log.Fatal(err)
     }
 
     flag.StringVar(&httpTail.Username, "u", "", "Specify the username on an HTTP server")
@@ -36,15 +30,15 @@ func main() {
     flag.Parse()
 
     if *readPassword {
-        pwd, err := ReadPassword()
+        password, err := ReadPassword()
         if err != nil {
             log.Fatal(err)
         }
-        httpTail.SetPassword(string(pwd))
+        httpTail.SetPassword(password)
     }
 
     httpTail.Url = flag.Arg(0)
-    if _, err := io.Copy(os.Stdout, &httpTail); err != nil {
+    if _, err := io.Copy(os.Stdout, httpTail); err != nil {
         log.Fatal(err)
     }
 }
@@ -58,14 +52,63 @@ type HttpTail struct {
     Key []byte
 }
 
-func (self *HttpTail) SetPassword(p string) {
-    // TODO: crypt with random key
-    self.Password = p
+func NewHttpTail() (*HttpTail, error) {
+    key := make([]byte, 32)
+    if n, err := rand.Read(key); err != nil {
+        return nil, err
+    } else {
+        key = key[:n]
+    }
+
+    return &HttpTail{
+        Client: &http.Client{
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{
+                    InsecureSkipVerify: true,
+                },
+            },
+        },
+        Key: key,
+    }, nil
 }
 
-func (self *HttpTail) GetPassword() string {
-    // TODO: uncrypt with random key
-    return self.Password
+func (self *HttpTail) SetPassword(password []byte) error {
+    block, err := aes.NewCipher(self.Key)
+    if err != nil {
+        return err
+    }
+
+    ct := make([]byte, aes.BlockSize + len(password))
+
+    iv := ct[:aes.BlockSize]
+    if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+        return err
+    }
+
+    stream := cipher.NewCFBEncrypter(block, iv)
+    stream.XORKeyStream(ct[aes.BlockSize:], password)
+
+    self.Password = base64.URLEncoding.EncodeToString(ct)
+
+    return nil
+}
+
+func (self *HttpTail) GetPassword() (string, error) {
+    ct, _ := base64.URLEncoding.DecodeString(self.Password)
+
+    block, err := aes.NewCipher(self.Key)
+    if err != nil {
+        return "", err
+    }
+
+    iv := ct[:aes.BlockSize]
+    ct = ct[aes.BlockSize:]
+
+    stream := cipher.NewCFBDecrypter(block, iv)
+
+    stream.XORKeyStream(ct, ct)
+
+    return fmt.Sprintf("%s", ct), nil
 }
 
 func (self *HttpTail) Read(p []byte) (n int, err error) {
@@ -73,6 +116,7 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
         if self.Pos, err = self.ContentLength(); err != nil {
             return 0, err
         }
+
         if self.Pos > 1024 {
             self.Pos -= 1024
         } else {
@@ -86,7 +130,11 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
     }
 
     if len(self.Username) > 0 && len(self.Password) > 0 {
-        req.SetBasicAuth(self.Username, self.GetPassword())
+        pwd, err := self.GetPassword()
+        if err != nil {
+            return 0, err
+        }
+        req.SetBasicAuth(self.Username, pwd)
     }
 
     req.Header.Set("Range", fmt.Sprintf("bytes=%d-", self.Pos))
@@ -100,9 +148,11 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
 
     if res.StatusCode == http.StatusPartialContent {
         n, err = res.Body.Read(p)
-        if err != io.EOF {
+
+        if err != nil && err != io.EOF {
             return 0, err
         }
+
         self.Pos += res.ContentLength
 
         return n, nil
@@ -123,7 +173,11 @@ func (self *HttpTail) ContentLength() (n int64, err error) {
     }
 
     if len(self.Username) > 0 && len(self.Password) > 0 {
-        req.SetBasicAuth(self.Username, self.Password)
+        pwd, err := self.GetPassword()
+        if err != nil {
+            return 0, err
+        }
+        req.SetBasicAuth(self.Username, pwd)
     }
 
     res, err := self.Client.Do(req)
@@ -137,7 +191,7 @@ func (self *HttpTail) ContentLength() (n int64, err error) {
         return res.ContentLength, nil
     }
 
-    return 0, nil
+    return 0, fmt.Errorf(http.StatusText(res.StatusCode))
 }
 
 func ReadPassword() ([]byte, error) {
