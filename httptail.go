@@ -15,7 +15,6 @@ import (
     "net/http"
     "os"
     "syscall"
-    "strings"
     "time"
     "bufio"
 )
@@ -83,7 +82,7 @@ func (self *HttpTailConfig) Scan() {
     for {
         line := <-self.Lines
         if !self.Quiet {
-            if strings.Compare(file, line.File) != 0 {
+            if file != line.File {
                 fmt.Println()
                 fmt.Println("==>", line.File, "<==")
             }
