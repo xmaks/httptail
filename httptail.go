@@ -15,64 +15,85 @@ import (
     "net/http"
     "os"
     "syscall"
+    "strings"
     "time"
+    "bufio"
 )
 
 func main() {
-    httpTail, err := NewHttpTail()
+    username := flag.String("u", "", "Specify the username on an HTTP server")
+    readPassword := flag.Bool("p", false, "Specify the password on an HTTP server")
+    quiet := flag.Bool("q", false, "")
+
+    flag.Parse()
+
+    var password []byte = nil
+    if *readPassword {
+        pwd, err := ReadPassword()
+        if err != nil {
+            log.Fatal(err)
+        }
+        password = pwd
+    }
+
+    httpTailConfig, err := NewHttpTailConfig()
     if err != nil {
         log.Fatal(err)
     }
 
-    flag.StringVar(&httpTail.Username, "u", "", "Specify the username on an HTTP server")
-    readPassword := flag.Bool("p", false, "Specify the password on an HTTP server")
+    httpTailConfig.Username = *username
+    httpTailConfig.SetPassword(password)
+    httpTailConfig.Quiet = *quiet
 
-    flag.Parse()
-
-    if *readPassword {
-        password, err := ReadPassword()
-        if err != nil {
-            log.Fatal(err)
-        }
-        httpTail.SetPassword(password)
+    for _, url := range flag.Args() {
+        go NewHttpTail(httpTailConfig, url).Scan()
     }
 
-    httpTail.Url = flag.Arg(0)
-    if _, err := io.Copy(os.Stdout, httpTail); err != nil {
-        log.Fatal(err)
-    }
+    httpTailConfig.Scan()
 }
 
-type HttpTail struct {
-    Url string
-    Client *http.Client
+type Line struct {
+    File string
+    Text string
+}
+
+type HttpTailConfig struct {
     Username string
     Password string
-    Pos int64
     Key []byte
+    Lines chan Line
+    Quiet bool
 }
 
-func NewHttpTail() (*HttpTail, error) {
+func NewHttpTailConfig() (*HttpTailConfig, error) {
     key := make([]byte, 32)
     if n, err := rand.Read(key); err != nil {
         return nil, err
     } else {
         key = key[:n]
     }
-
-    return &HttpTail{
-        Client: &http.Client{
-            Transport: &http.Transport{
-                TLSClientConfig: &tls.Config{
-                    InsecureSkipVerify: true,
-                },
-            },
-        },
+    return &HttpTailConfig{
         Key: key,
+        Lines: make(chan Line, 512),
     }, nil
 }
 
-func (self *HttpTail) SetPassword(password []byte) error {
+func (self *HttpTailConfig) Scan() {
+    file := ""
+    for {
+        line := <-self.Lines
+        if !self.Quiet {
+            if strings.Compare(file, line.File) != 0 {
+                fmt.Println()
+                fmt.Println("==>", line.File, "<==")
+            }
+        }
+        fmt.Println(line.Text)
+        file = line.File
+    }
+}
+
+func (self *HttpTailConfig) SetPassword(password []byte) error {
     block, err := aes.NewCipher(self.Key)
     if err != nil {
         return err
@@ -93,7 +114,7 @@ func (self *HttpTail) SetPassword(password []byte) error {
     return nil
 }
 
-func (self *HttpTail) GetPassword() (string, error) {
+func (self *HttpTailConfig) GetPassword() (string, error) {
     ct, _ := base64.URLEncoding.DecodeString(self.Password)
 
     block, err := aes.NewCipher(self.Key)
@@ -109,6 +130,44 @@ func (self *HttpTail) GetPassword() (string, error) {
     stream.XORKeyStream(ct, ct)
 
     return fmt.Sprintf("%s", ct), nil
+}
+
+type HttpTail struct {
+    Config *HttpTailConfig
+    Url string
+    Client *http.Client
+    Pos int64
+}
+
+func NewHttpTail(config *HttpTailConfig, url string) *HttpTail {
+    return &HttpTail{
+        Config: config,
+        Client: &http.Client{
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{
+                    InsecureSkipVerify: true,
+                },
+            },
+        },
+        Url: url,
+    }
+}
+
+func (self *HttpTail) Scan() {
+    scanner := bufio.NewScanner(self)
+    for scanner.Scan() {
+        self.Config.Lines <- Line{
+            File: self.Url,
+            Text: scanner.Text(),
+        }
+    }
+
+    if err := scanner.Err(); err != nil {
+        self.Config.Lines <- Line{
+            File: self.Url,
+            Text: err.Error(),
+        }
+    }
 }
 
 func (self *HttpTail) Read(p []byte) (n int, err error) {
@@ -129,12 +188,12 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
         return 0, err
     }
 
-    if len(self.Username) > 0 && len(self.Password) > 0 {
-        pwd, err := self.GetPassword()
+    if len(self.Config.Username) > 0 && len(self.Config.Password) > 0 {
+        pwd, err := self.Config.GetPassword()
         if err != nil {
             return 0, err
         }
-        req.SetBasicAuth(self.Username, pwd)
+        req.SetBasicAuth(self.Config.Username, pwd)
     }
 
     req.Header.Set("Range", fmt.Sprintf("bytes=%d-", self.Pos))
@@ -172,12 +231,12 @@ func (self *HttpTail) ContentLength() (n int64, err error) {
         return 0, err
     }
 
-    if len(self.Username) > 0 && len(self.Password) > 0 {
-        pwd, err := self.GetPassword()
+    if len(self.Config.Username) > 0 && len(self.Config.Password) > 0 {
+        pwd, err := self.Config.GetPassword()
         if err != nil {
             return 0, err
         }
-        req.SetBasicAuth(self.Username, pwd)
+        req.SetBasicAuth(self.Config.Username, pwd)
     }
 
     res, err := self.Client.Do(req)
@@ -196,6 +255,7 @@ func (self *HttpTail) ContentLength() (n int64, err error) {
 
 func ReadPassword() ([]byte, error) {
     if terminal.IsTerminal(syscall.Stdin) {
+        fmt.Print("Password:")
         pwd, err := terminal.ReadPassword(syscall.Stdin)
         if err != nil {
             return nil, err
