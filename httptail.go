@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bufio"
     "crypto/aes"
     "crypto/cipher"
     "crypto/rand"
@@ -14,90 +15,150 @@ import (
     "log"
     "net/http"
     "os"
+    "strings"
+    "sync"
     "syscall"
     "time"
-    "bufio"
+)
+
+type (
+    HttpUrls struct {
+        *http.Client
+        Quiet bool
+        Follow bool
+        Bytes int64
+        Debug bool
+        Username string
+        ReadPassword bool
+        Password string
+        Urls []string
+        SecretKey []byte
+    }
+
+    HttpUrl struct {
+        *HttpUrls
+        Url string
+        UrlIdx int
+        CurrentBytes int64
+        ReadedBytes int64
+    }
+
+    HttpUrlLine struct {
+        Text string
+        UrlIdx int
+    }
 )
 
 func main() {
-    username := flag.String("u", "", "Specify the username on an HTTP server")
-    readPassword := flag.Bool("p", false, "Specify the password on an HTTP server")
-    quiet := flag.Bool("q", false, "")
-
-    flag.Parse()
-
-    var password []byte = nil
-    if *readPassword {
-        pwd, err := ReadPassword()
-        if err != nil {
-            log.Fatal(err)
-        }
-        password = pwd
-    }
-
-    httpTailConfig, err := NewHttpTailConfig()
+    httpUrls, err := NewHttpUrls()
     if err != nil {
         log.Fatal(err)
     }
+    httpUrls.Tail()
+}
 
-    httpTailConfig.Username = *username
-    httpTailConfig.SetPassword(password)
-    httpTailConfig.Quiet = *quiet
-
-    for _, url := range flag.Args() {
-        go NewHttpTail(httpTailConfig, url).Scan()
+func NewHttpUrls() (*HttpUrls, error) {
+    name, sep := os.Args[0], "/"
+    idx := strings.LastIndex(name, sep)
+    if idx != -1 {
+        name = name[idx + len(sep):]
     }
 
-    httpTailConfig.Scan()
-}
-
-type Line struct {
-    File string
-    Text string
-}
-
-type HttpTailConfig struct {
-    Username string
-    Password string
-    Key []byte
-    Lines chan Line
-    Quiet bool
-}
-
-func NewHttpTailConfig() (*HttpTailConfig, error) {
-    key := make([]byte, 32)
-    if n, err := rand.Read(key); err != nil {
-        return nil, err
-    } else {
-        key = key[:n]
+    httpUrls := &HttpUrls{
+        Client: &http.Client{
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{
+                    InsecureSkipVerify: true,
+                },
+            },
+        },
     }
-    return &HttpTailConfig{
-        Key: key,
-        Lines: make(chan Line, 512),
-    }, nil
-}
 
-func (self *HttpTailConfig) Scan() {
-    file := ""
-    for {
-        line := <-self.Lines
-        if !self.Quiet {
-            if file != line.File {
-                fmt.Println()
-                fmt.Println("==>", line.File, "<==")
+    flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
+    flagSet.BoolVar(&httpUrls.Quiet, "q", false, "Suppresses printing of headers")
+    flagSet.BoolVar(&httpUrls.Follow, "f", false, "Do not stop when end of file is reached")
+    flagSet.Int64Var(&httpUrls.Bytes, "c", 1024, "The location is number bytes")
+    flagSet.BoolVar(&httpUrls.Debug, "d", false, "Show debug info")
+    flagSet.StringVar(&httpUrls.Username, "u", "", "The user name to use when connecting to the HTTP server")
+    flagSet.BoolVar(&httpUrls.ReadPassword, "p", false, "Reads the password to use when connecting to the HTTP server")
+    flagSet.Parse(os.Args[1:])
+
+    if httpUrls.ReadPassword {
+        key := make([]byte, 32)
+        if n, err := rand.Read(key); err != nil {
+            return nil, err
+        } else {
+            httpUrls.SecretKey = key[:n]
+        }
+
+        if terminal.IsTerminal(syscall.Stdin) {
+            fmt.Print("Password:")
+            pwd, err := terminal.ReadPassword(syscall.Stdin)
+            if err != nil {
+                return nil, err
+            }
+            if err = httpUrls.SetPassword(pwd); err != nil {
+                return nil, err
+            }
+        } else {
+            pwd, err := ioutil.ReadAll(os.Stdin)
+            if err != nil {
+                return nil, err
+            }
+            if err = httpUrls.SetPassword(pwd); err != nil {
+                return nil, err
             }
         }
+    }
+
+    urls := make(map[string]bool)
+    for _, url := range flagSet.Args() {
+        if _, ok := urls[url]; !ok {
+            httpUrls.Urls = append(httpUrls.Urls, url)
+            urls[url] = true
+        }
+    }
+
+    return httpUrls, nil
+}
+
+func (this *HttpUrls) Tail() {
+    var lastUrlIdx int = -1
+    for line := range this.Lines() {
+        if !this.Quiet && lastUrlIdx != line.UrlIdx {
+            fmt.Printf("==> %s <==\n", this.Urls[line.UrlIdx])
+            lastUrlIdx = line.UrlIdx
+        }
         fmt.Println(line.Text)
-        file = line.File
     }
 }
 
-func (self *HttpTailConfig) SetPassword(password []byte) error {
-    block, err := aes.NewCipher(self.Key)
+func (this *HttpUrls) Lines() <-chan *HttpUrlLine {
+    lines := make(chan *HttpUrlLine, len(this.Urls) * 64)
+
+    go func() {
+        var wg sync.WaitGroup
+
+        defer close(lines)
+        defer wg.Wait()
+
+        wg.Add(len(this.Urls))
+        for urlIdx, url := range this.Urls {
+            go func(url string, urlIdx int) {
+                defer wg.Done()
+                NewHttpUrl(this, url, urlIdx).Tail(lines)
+            }(url, urlIdx)
+        }
+    }()
+
+    return lines
+}
+
+func (this *HttpUrls) SetPassword(password []byte) error {
+    block, err := aes.NewCipher(this.SecretKey)
     if err != nil {
         return err
     }
-
     ct := make([]byte, aes.BlockSize + len(password))
 
     iv := ct[:aes.BlockSize]
@@ -108,15 +169,15 @@ func (self *HttpTailConfig) SetPassword(password []byte) error {
     stream := cipher.NewCFBEncrypter(block, iv)
     stream.XORKeyStream(ct[aes.BlockSize:], password)
 
-    self.Password = base64.URLEncoding.EncodeToString(ct)
+    this.Password = base64.URLEncoding.EncodeToString(ct)
 
     return nil
 }
 
-func (self *HttpTailConfig) GetPassword() (string, error) {
-    ct, _ := base64.URLEncoding.DecodeString(self.Password)
+func (this *HttpUrls) GetPassword() (string, error) {
+    ct, _ := base64.URLEncoding.DecodeString(this.Password)
 
-    block, err := aes.NewCipher(self.Key)
+    block, err := aes.NewCipher(this.SecretKey)
     if err != nil {
         return "", err
     }
@@ -131,73 +192,82 @@ func (self *HttpTailConfig) GetPassword() (string, error) {
     return fmt.Sprintf("%s", ct), nil
 }
 
-type HttpTail struct {
-    Config *HttpTailConfig
-    Url string
-    Client *http.Client
-    Pos int64
-}
-
-func NewHttpTail(config *HttpTailConfig, url string) *HttpTail {
-    return &HttpTail{
-        Config: config,
-        Client: &http.Client{
-            Transport: &http.Transport{
-                TLSClientConfig: &tls.Config{
-                    InsecureSkipVerify: true,
-                },
-            },
-        },
+func NewHttpUrl(httpUrls *HttpUrls, url string, urlIdx int) *HttpUrl {
+    return &HttpUrl{
+        HttpUrls: httpUrls,
         Url: url,
+        UrlIdx: urlIdx,
+        CurrentBytes: -1,
+        ReadedBytes: 0,
     }
 }
 
-func (self *HttpTail) Scan() {
-    scanner := bufio.NewScanner(self)
+func (this *HttpUrl) Tail(lines chan<- *HttpUrlLine) {
+    n, err := this.ContentLength()
+    if err != nil {
+        lines <- &HttpUrlLine{
+            UrlIdx: this.UrlIdx,
+            Text: err.Error(),
+        }
+        return
+    }
+
+    this.CurrentBytes = n
+    if this.CurrentBytes >= this.HttpUrls.Bytes {
+        this.CurrentBytes -= this.HttpUrls.Bytes
+    } else {
+        this.CurrentBytes = 0
+    }
+
+    firstLine := true
+    scanner := bufio.NewScanner(this)
     for scanner.Scan() {
-        self.Config.Lines <- Line{
-            File: self.Url,
+        if firstLine {
+            firstLine = false
+            continue
+        }
+        lines <- &HttpUrlLine{
+            UrlIdx: this.UrlIdx,
             Text: scanner.Text(),
         }
     }
-
     if err := scanner.Err(); err != nil {
-        self.Config.Lines <- Line{
-            File: self.Url,
+        lines <- &HttpUrlLine{
+            UrlIdx: this.UrlIdx,
             Text: err.Error(),
         }
     }
 }
 
-func (self *HttpTail) Read(p []byte) (n int, err error) {
-    if self.Pos == 0 {
-        if self.Pos, err = self.ContentLength(); err != nil {
-            return 0, err
-        }
-
-        if self.Pos > 1024 {
-            self.Pos -= 1024
-        } else {
-            self.Pos = 0
-        }
+func (this *HttpUrl) ContentLength() (int64, error) {
+    req, err := this.NewHttpRequest("HEAD")
+    if err != nil {
+        return -1, err
     }
 
-    req, err := http.NewRequest("GET", self.Url, nil)
+    res, err := this.HttpUrls.Client.Do(req)
+    if err != nil {
+        return -1, err
+    }
+
+    defer res.Body.Close()
+
+    if res.StatusCode == http.StatusOK {
+         return res.ContentLength, nil
+    }
+
+    return -1, fmt.Errorf(http.StatusText(res.StatusCode))
+}
+
+func (this *HttpUrl) Read(p []byte) (int, error) {
+    req, err := this.NewHttpRequest("GET")
     if err != nil {
         return 0, err
     }
 
-    if len(self.Config.Username) > 0 && len(self.Config.Password) > 0 {
-        pwd, err := self.Config.GetPassword()
-        if err != nil {
-            return 0, err
-        }
-        req.SetBasicAuth(self.Config.Username, pwd)
-    }
+    req.Header.Set("Range", fmt.Sprintf("bytes=%d-", this.CurrentBytes))
 
-    req.Header.Set("Range", fmt.Sprintf("bytes=%d-", self.Pos))
-
-    res, err := self.Client.Do(req)
+    res, err := this.HttpUrls.Client.Do(req)
     if err != nil {
         return 0, err
     }
@@ -205,66 +275,41 @@ func (self *HttpTail) Read(p []byte) (n int, err error) {
     defer res.Body.Close()
 
     if res.StatusCode == http.StatusPartialContent {
-        n, err = res.Body.Read(p)
-
+        n, err := res.Body.Read(p)
         if err != nil && err != io.EOF {
             return 0, err
         }
+        this.CurrentBytes += int64(n)
+        this.ReadedBytes += int64(n)
 
-        self.Pos += res.ContentLength
+        if !this.HttpUrls.Follow && this.ReadedBytes >= this.HttpUrls.Bytes {
+            return n, io.EOF
+        }
 
         return n, nil
     }
 
     if res.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-        time.Sleep(1 * time.Second)
+        time.Sleep(100 * time.Millisecond)
         return 0, nil
     }
 
     return 0, fmt.Errorf(http.StatusText(res.StatusCode))
 }
 
-func (self *HttpTail) ContentLength() (n int64, err error) {
-    req, err := http.NewRequest("HEAD", self.Url, nil)
+func (this *HttpUrl) NewHttpRequest(method string) (*http.Request, error) {
+    req, err := http.NewRequest(method, this.HttpUrls.Urls[this.UrlIdx], nil)
     if err != nil {
-        return 0, err
+        return nil, err
     }
 
-    if len(self.Config.Username) > 0 && len(self.Config.Password) > 0 {
-        pwd, err := self.Config.GetPassword()
-        if err != nil {
-            return 0, err
-        }
-        req.SetBasicAuth(self.Config.Username, pwd)
-    }
-
-    res, err := self.Client.Do(req)
-    if err != nil {
-        return 0, err
-    }
-
-    defer res.Body.Close()
-
-    if res.StatusCode == http.StatusOK {
-        return res.ContentLength, nil
-    }
-
-    return 0, fmt.Errorf(http.StatusText(res.StatusCode))
-}
-
-func ReadPassword() ([]byte, error) {
-    if terminal.IsTerminal(syscall.Stdin) {
-        fmt.Print("Password:")
-        pwd, err := terminal.ReadPassword(syscall.Stdin)
+    if len(this.HttpUrls.Username) > 0 && len(this.HttpUrls.Password) > 0 {
+        password, err := this.HttpUrls.GetPassword()
         if err != nil {
             return nil, err
         }
-        return pwd, nil
-    } else {
-        pwd, err := ioutil.ReadAll(os.Stdin)
-        if err != nil {
-            return nil, err
-        }
-        return pwd[:len(pwd) - 1], nil
+        req.SetBasicAuth(this.HttpUrls.Username, password)
     }
+
+    return req, nil
 }
