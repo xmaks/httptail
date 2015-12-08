@@ -74,7 +74,7 @@ func NewHttpUrls() (*HttpUrls, error) {
         },
     }
 
-    flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
+    flagSet := flag.NewFlagSet(name, flag.ExitOnError)
     flagSet.BoolVar(&httpUrls.Quiet, "q", false, "Suppresses printing of headers")
     flagSet.BoolVar(&httpUrls.Follow, "f", false, "Do not stop when end of file is reached")
     flagSet.Int64Var(&httpUrls.Bytes, "c", 1024, "The location is number bytes")
@@ -92,7 +92,7 @@ func NewHttpUrls() (*HttpUrls, error) {
         }
 
         if terminal.IsTerminal(syscall.Stdin) {
-            fmt.Print("Password:")
+            fmt.Fprintf(os.Stderr, "Password:")
             pwd, err := terminal.ReadPassword(syscall.Stdin)
             if err != nil {
                 return nil, err
